@@ -3,11 +3,15 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPaintEvent, QPalette, QPen, 
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QComboBox,
+    QHBoxLayout,
     QHeaderView,
+    QLabel,
     QMainWindow,
     QStyle,
     QStyleOptionViewItem,
     QTableView,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -31,22 +35,131 @@ ARROW_COLOR = QColor(55, 55, 55)
 ROW0_HEADER_HEIGHT = 26
 ROW1_HEADER_HEIGHT = 28
 
+FILTER_ALL = ""
+
+
+def side_matches_filter(
+    row: dict[str, str | None],
+    prefix: str,
+    device_type: str | None,
+    device: str | None,
+    pin: str | None,
+) -> bool:
+    if device_type and row.get(f"{prefix}_type") != device_type:
+        return False
+    if device and row.get(f"{prefix}_device") != device:
+        return False
+    if pin and row.get(f"{prefix}_pin") != pin:
+        return False
+    return True
+
+
+def row_matches_filter(
+    row: dict[str, str | None],
+    device_type: str | None,
+    device: str | None,
+    pin: str | None,
+) -> bool:
+    if not device_type and not device and not pin:
+        return True
+    return side_matches_filter(row, "source", device_type, device, pin) or side_matches_filter(
+        row, "target", device_type, device, pin
+    )
+
+
+def should_swap_for_display(
+    row: dict[str, str | None],
+    device_type: str | None,
+    device: str | None,
+    pin: str | None,
+) -> bool:
+    if not device_type and not device and not pin:
+        return False
+    if side_matches_filter(row, "source", device_type, device, pin):
+        return False
+    return side_matches_filter(row, "target", device_type, device, pin)
+
+
+def column_key_for_row(
+    row: dict[str, str | None],
+    column: int,
+    device_type: str | None,
+    device: str | None,
+    pin: str | None,
+) -> str:
+    if should_swap_for_display(row, device_type, device, pin):
+        swapped_keys = (
+            "target_type",
+            "target_device",
+            "target_pin",
+            "source_type",
+            "source_device",
+            "source_pin",
+        )
+        return swapped_keys[column]
+    return COLUMN_KEYS[column]
+
+
+def unique_types(rows: list[dict[str, str | None]]) -> list[str]:
+    types: set[str] = set()
+    for row in rows:
+        if row.get("source_type"):
+            types.add(row["source_type"])
+        if row.get("target_type"):
+            types.add(row["target_type"])
+    return sorted(types)
+
+
+def devices_for_type(rows: list[dict[str, str | None]], device_type: str) -> list[str]:
+    devices: set[str] = set()
+    for row in rows:
+        if row.get("source_type") == device_type and row.get("source_device"):
+            devices.add(row["source_device"])
+        if row.get("target_type") == device_type and row.get("target_device"):
+            devices.add(row["target_device"])
+    return sorted(devices)
+
+
+def pins_for_device(
+    rows: list[dict[str, str | None]], device_type: str, device: str
+) -> list[str]:
+    pins: set[str] = set()
+    for row in rows:
+        if row.get("source_type") == device_type and row.get("source_device") == device:
+            if row.get("source_pin"):
+                pins.add(row["source_pin"])
+        if row.get("target_type") == device_type and row.get("target_device") == device:
+            if row.get("target_pin"):
+                pins.add(row["target_pin"])
+    return sorted(pins)
+
 
 class Model(QAbstractTableModel):
     def __init__(self, rows: list[dict[str, str | None]]):
         super().__init__()
-        self.model_data = rows
+        self.all_data = rows
+        self.visible_indices = list(range(len(rows)))
+        self._filter_type: str | None = None
+        self._filter_device: str | None = None
+        self._filter_pin: str | None = None
 
     def rowCount(self, parent=QModelIndex()):
-        return len(self.model_data)
+        return len(self.visible_indices)
 
     def columnCount(self, parent=QModelIndex()):
         return COLUMN_COUNT
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
-            row = self.model_data[index.row()]
-            return row.get(COLUMN_KEYS[index.column()])
+            row = self.all_data[self.visible_indices[index.row()]]
+            key = column_key_for_row(
+                row,
+                index.column(),
+                self._filter_type,
+                self._filter_device,
+                self._filter_pin,
+            )
+            return row.get(key)
         return None
 
     def flags(self, index):
@@ -65,7 +178,16 @@ class Model(QAbstractTableModel):
 
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
         if role == Qt.ItemDataRole.EditRole:
-            self.model_data[index.row()][COLUMN_KEYS[index.column()]] = value
+            actual_row = self.visible_indices[index.row()]
+            row = self.all_data[actual_row]
+            key = column_key_for_row(
+                row,
+                index.column(),
+                self._filter_type,
+                self._filter_device,
+                self._filter_pin,
+            )
+            row[key] = value
             self.dataChanged.emit(
                 index,
                 index,
@@ -74,9 +196,28 @@ class Model(QAbstractTableModel):
             return True
         return False
 
+    def apply_filters(
+        self,
+        device_type: str | None = None,
+        device: str | None = None,
+        pin: str | None = None,
+    ) -> None:
+        self._filter_type = device_type
+        self._filter_device = device
+        self._filter_pin = pin
+        self.beginResetModel()
+        self.visible_indices = [
+            i
+            for i, row in enumerate(self.all_data)
+            if row_matches_filter(row, device_type, device, pin)
+        ]
+        self.endResetModel()
+
     def addRow(self):
-        self.beginInsertRows(QModelIndex(), len(self.model_data), len(self.model_data))
-        self.model_data.append({key: None for key in COLUMN_KEYS})
+        row_index = len(self.all_data)
+        self.beginInsertRows(QModelIndex(), row_index, row_index)
+        self.all_data.append({key: None for key in COLUMN_KEYS})
+        self.visible_indices.append(row_index)
         self.endInsertRows()
 
 
@@ -280,113 +421,349 @@ class CustomTableView(QTableView):
         painter.restore()
 
 
+class FilterBar(QWidget):
+    def __init__(self, model: Model, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._model = model
+        self._updating = False
+
+        self.type_combo = QComboBox()
+        self.device_combo = QComboBox()
+        self.pin_combo = QComboBox()
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 4)
+        layout.addWidget(QLabel("Type:"))
+        layout.addWidget(self.type_combo, stretch=1)
+        layout.addWidget(QLabel("Device:"))
+        layout.addWidget(self.device_combo, stretch=2)
+        layout.addWidget(QLabel("Pin:"))
+        layout.addWidget(self.pin_combo, stretch=1)
+
+        self.type_combo.currentTextChanged.connect(self._on_type_changed)
+        self.device_combo.currentTextChanged.connect(self._on_device_changed)
+        self.pin_combo.currentTextChanged.connect(self._on_pin_changed)
+
+        self._populate_types()
+
+    def _populate_types(self) -> None:
+        self._set_combo_items(self.type_combo, unique_types(self._model.all_data))
+
+    def _populate_devices(self, device_type: str) -> None:
+        devices = devices_for_type(self._model.all_data, device_type) if device_type else []
+        self._set_combo_items(self.device_combo, devices)
+
+    def _populate_pins(self, device_type: str, device: str) -> None:
+        pins = (
+            pins_for_device(self._model.all_data, device_type, device)
+            if device_type and device
+            else []
+        )
+        self._set_combo_items(self.pin_combo, pins)
+
+    def _set_combo_items(self, combo: QComboBox, items: list[str]) -> None:
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("All", FILTER_ALL)
+        for item in items:
+            combo.addItem(item, item)
+        combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+
+    def _selected_value(self, combo: QComboBox) -> str | None:
+        value = combo.currentData()
+        return value if value else None
+
+    def _apply_filters(self) -> None:
+        if self._updating:
+            return
+        self._model.apply_filters(
+            self._selected_value(self.type_combo),
+            self._selected_value(self.device_combo),
+            self._selected_value(self.pin_combo),
+        )
+
+    def _on_type_changed(self, _text: str) -> None:
+        self._updating = True
+        device_type = self._selected_value(self.type_combo)
+        self._populate_devices(device_type or "")
+        self._populate_pins(device_type or "", self._selected_value(self.device_combo) or "")
+        self._updating = False
+        self._apply_filters()
+
+    def _on_device_changed(self, _text: str) -> None:
+        self._updating = True
+        device_type = self._selected_value(self.type_combo) or ""
+        device = self._selected_value(self.device_combo) or ""
+        self._populate_pins(device_type, device)
+        self._updating = False
+        self._apply_filters()
+
+    def _on_pin_changed(self, _text: str) -> None:
+        self._apply_filters()
+
+
+SAMPLE_DATA: list[dict[str, str | None]] = [
+    # ANT devices: Antenna 1–6, Roof Antenna, GPS Antenna
+    {
+        "source_type": "ANT",
+        "source_device": "Antenna 1",
+        "source_pin": "IN",
+        "target_type": "FEM",
+        "target_device": "Device 1",
+        "target_pin": "OUT",
+    },
+    {
+        "source_type": "ANT",
+        "source_device": "Antenna 1",
+        "source_pin": "OUT",
+        "target_type": "COUPLER",
+        "target_device": "SAMPLE_COUPLER",
+        "target_pin": "IN",
+    },
+    {
+        "source_type": "FEM",
+        "source_device": "Device 1",
+        "source_pin": "OUT",
+        "target_type": "COUPLER",
+        "target_device": "SAMPLE_COUPLER",
+        "target_pin": "IN",
+    },
+    {
+        "source_type": "COUPLER",
+        "source_device": "SAMPLE_COUPLER",
+        "source_pin": "IN",
+        "target_type": "ANT",
+        "target_device": "Antenna 2",
+        "target_pin": "OUT",
+    },
+    {
+        "source_type": "ANT",
+        "source_device": "Antenna 2",
+        "source_pin": "IN",
+        "target_type": "FEM",
+        "target_device": "Device 2",
+        "target_pin": "OUT",
+    },
+    {
+        "source_type": "FEM",
+        "source_device": "QORVOQM77180",
+        "source_pin": "IN",
+        "target_type": "LNA",
+        "target_device": "QORVOQM77180",
+        "target_pin": "OUT",
+    },
+    {
+        "source_type": "LNA",
+        "source_device": "QORVOQM77180",
+        "source_pin": "OUT",
+        "target_type": "FEM",
+        "target_device": "Device 2",
+        "target_pin": "IN",
+    },
+    {
+        "source_type": "FEM",
+        "source_device": "Device 2",
+        "source_pin": "IN",
+        "target_type": "COUPLER",
+        "target_device": "MAIN_COUPLER",
+        "target_pin": "OUT",
+    },
+    {
+        "source_type": "COUPLER",
+        "source_device": "MAIN_COUPLER",
+        "source_pin": "OUT",
+        "target_type": "ANT",
+        "target_device": "Antenna 3",
+        "target_pin": "IN",
+    },
+    {
+        "source_type": "ANT",
+        "source_device": "Antenna 3",
+        "source_pin": "IN",
+        "target_type": "FEM",
+        "target_device": "Device 3",
+        "target_pin": "OUT",
+    },
+    {
+        "source_type": "FEM",
+        "source_device": "Device 3",
+        "source_pin": "IN",
+        "target_type": "COUPLER",
+        "target_device": "BRANCH_COUPLER",
+        "target_pin": "OUT",
+    },
+    {
+        "source_type": "COUPLER",
+        "source_device": "BRANCH_COUPLER",
+        "source_pin": "OUT",
+        "target_type": "ANT",
+        "target_device": "Antenna 4",
+        "target_pin": "IN",
+    },
+    {
+        "source_type": "ANT",
+        "source_device": "Antenna 4",
+        "source_pin": "OUT",
+        "target_type": "FEM",
+        "target_device": "SKY77643",
+        "target_pin": "IN",
+    },
+    {
+        "source_type": "FEM",
+        "source_device": "SKY77643",
+        "source_pin": "OUT",
+        "target_type": "LNA",
+        "target_device": "SKY67151",
+        "target_pin": "IN",
+    },
+    {
+        "source_type": "LNA",
+        "source_device": "SKY67151",
+        "source_pin": "OUT",
+        "target_type": "FEM",
+        "target_device": "QPF7218",
+        "target_pin": "IN",
+    },
+    {
+        "source_type": "FEM",
+        "source_device": "QPF7218",
+        "source_pin": "OUT",
+        "target_type": "COUPLER",
+        "target_device": "HYBRID_COUPLER",
+        "target_pin": "IN",
+    },
+    {
+        "source_type": "COUPLER",
+        "source_device": "HYBRID_COUPLER",
+        "source_pin": "OUT",
+        "target_type": "ANT",
+        "target_device": "Antenna 5",
+        "target_pin": "IN",
+    },
+    {
+        "source_type": "ANT",
+        "source_device": "Antenna 5",
+        "source_pin": "IN",
+        "target_type": "LNA",
+        "target_device": "BGA725L6",
+        "target_pin": "OUT",
+    },
+    {
+        "source_type": "LNA",
+        "source_device": "BGA725L6",
+        "source_pin": "IN",
+        "target_type": "FEM",
+        "target_device": "Device 4",
+        "target_pin": "OUT",
+    },
+    {
+        "source_type": "FEM",
+        "source_device": "Device 4",
+        "source_pin": "IN",
+        "target_type": "COUPLER",
+        "target_device": "SAMPLE_COUPLER",
+        "target_pin": "OUT",
+    },
+    {
+        "source_type": "COUPLER",
+        "source_device": "SAMPLE_COUPLER",
+        "source_pin": "IN",
+        "target_type": "ANT",
+        "target_device": "Roof Antenna",
+        "target_pin": "OUT",
+    },
+    {
+        "source_type": "ANT",
+        "source_device": "Roof Antenna",
+        "source_pin": "IN",
+        "target_type": "FEM",
+        "target_device": "Device 5",
+        "target_pin": "OUT",
+    },
+    {
+        "source_type": "FEM",
+        "source_device": "Device 5",
+        "source_pin": "OUT",
+        "target_type": "LNA",
+        "target_device": "QORVOQM13002",
+        "target_pin": "IN",
+    },
+    {
+        "source_type": "LNA",
+        "source_device": "QORVOQM13002",
+        "source_pin": "OUT",
+        "target_type": "COUPLER",
+        "target_device": "MAIN_COUPLER",
+        "target_pin": "IN",
+    },
+    {
+        "source_type": "COUPLER",
+        "source_device": "MAIN_COUPLER",
+        "source_pin": "OUT",
+        "target_type": "ANT",
+        "target_device": "GPS Antenna",
+        "target_pin": "IN",
+    },
+    {
+        "source_type": "ANT",
+        "source_device": "GPS Antenna",
+        "source_pin": "OUT",
+        "target_type": "FEM",
+        "target_device": "QORVOQM77180",
+        "target_pin": "IN",
+    },
+    {
+        "source_type": "LNA",
+        "source_device": "QORVOQM13002",
+        "source_pin": "IN",
+        "target_type": "FEM",
+        "target_device": "SKY77643",
+        "target_pin": "OUT",
+    },
+    {
+        "source_type": "FEM",
+        "source_device": "QORVOQM77180",
+        "source_pin": "OUT",
+        "target_type": "LNA",
+        "target_device": "BGA725L6",
+        "target_pin": "IN",
+    },
+    {
+        "source_type": "COUPLER",
+        "source_device": "BRANCH_COUPLER",
+        "source_pin": "IN",
+        "target_type": "ANT",
+        "target_device": "Antenna 6",
+        "target_pin": "OUT",
+    },
+    {
+        "source_type": "ANT",
+        "source_device": "Antenna 6",
+        "source_pin": "IN",
+        "target_type": "COUPLER",
+        "target_device": "HYBRID_COUPLER",
+        "target_pin": "OUT",
+    },
+]
+
+
 def main():
     app = QApplication([])
-    model = Model(
-        [
-            {
-                "source_type": "ANT",
-                "source_device": "Antenna 1",
-                "source_pin": "IN",
-                "target_type": "FEM",
-                "target_device": "Device 1",
-                "target_pin": "OUT",
-            },
-            {
-                "source_type": "FEM",
-                "source_device": "Device 1",
-                "source_pin": "OUT",
-                "target_type": "COUPLER",
-                "target_device": "SAMPLE_COUPLER",
-                "target_pin": "IN",
-            },
-            {
-                "source_type": "COUPLER",
-                "source_device": "SAMPLE_COUPLER",
-                "source_pin": "IN",
-                "target_type": "ANT",
-                "target_device": "Antenna 2",
-                "target_pin": "OUT",
-            },
-            {
-                "source_type": "FEM",
-                "source_device": "QORVOQM77180",
-                "source_pin": "IN",
-                "target_type": "LNA",
-                "target_device": "QORVOQM77180",
-                "target_pin": "OUT",
-            },
-            {
-                "source_type": "LNA",
-                "source_device": "QORVOQM77180",
-                "source_pin": "OUT",
-                "target_type": "FEM",
-                "target_device": "Device 2",
-                "target_pin": "IN",
-            },
-            {
-                "source_type": "FEM",
-                "source_device": "Device 2",
-                "source_pin": "IN",
-                "target_type": "COUPLER",
-                "target_device": "SAMPLE_COUPLER",
-                "target_pin": "OUT",
-            },
-            {
-                "source_type": "COUPLER",
-                "source_device": "SAMPLE_COUPLER",
-                "source_pin": "OUT",
-                "target_type": "ANT",
-                "target_device": "Antenna 3",
-                "target_pin": "IN",
-            },
-            {
-                "source_type": "FEM",
-                "source_device": "QORVOQM77180",
-                "source_pin": "IN",
-                "target_type": "LNA",
-                "target_device": "QORVOQM77180",
-                "target_pin": "OUT",
-            },
-            {
-                "source_type": "LNA",
-                "source_device": "QORVOQM77180",
-                "source_pin": "OUT",
-                "target_type": "FEM",
-                "target_device": "Device 3",
-                "target_pin": "IN",
-            },
-            {
-                "source_type": "FEM",
-                "source_device": "Device 3",
-                "source_pin": "IN",
-                "target_type": "COUPLER",
-                "target_device": "SAMPLE_COUPLER",
-                "target_pin": "OUT",
-            },
-            {
-                "source_type": "COUPLER",
-                "source_device": "SAMPLE_COUPLER",
-                "source_pin": "OUT",
-                "target_type": "ANT",
-                "target_device": "Antenna 4",
-                "target_pin": "IN",
-            },
-            {
-                "source_type": "FEM",
-                "source_device": "QORVOQM77180",
-                "source_pin": "IN",
-                "target_type": "LNA",
-                "target_device": "QORVOQM77180",
-                "target_pin": "OUT",
-            },
-        ]
-    )
+    model = Model(SAMPLE_DATA)
     view = CustomTableView(model)
+    filter_bar = FilterBar(model)
+
+    central = QWidget()
+    layout = QVBoxLayout(central)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)
+    layout.addWidget(filter_bar)
+    layout.addWidget(view)
 
     window = QMainWindow()
     window.setWindowTitle("Device mapping table")
-    window.setCentralWidget(view)
+    window.setCentralWidget(central)
     window.resize(1100, 520)
     window.show()
     return app.exec()
